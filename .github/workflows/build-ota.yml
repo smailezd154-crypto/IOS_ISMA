@@ -1,0 +1,105 @@
+name: Build OTA manifest
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-manifest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p ipa
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.ipa" \
+            --dir ipa
+
+      - name: Read app information
+        id: app
+        run: |
+          IPA=$(find ipa -name "*.ipa" | head -n 1)
+
+          mkdir -p extracted
+          unzip -q "$IPA" -d extracted
+
+          PLIST=$(find extracted/Payload -name "Info.plist" | head -n 1)
+
+          python3 - "$PLIST" <<'PY'
+          import plistlib
+          import json
+          import sys
+
+          plist_path = sys.argv[1]
+
+          with open(plist_path, "rb") as f:
+              data = plistlib.load(f)
+
+          result = {
+              "bundle_id": data.get("CFBundleIdentifier", ""),
+              "name": data.get("CFBundleDisplayName") or data.get("CFBundleName", "iOS App"),
+              "version": data.get("CFBundleShortVersionString") or data.get("CFBundleVersion", "1.0")
+          }
+
+          with open("app.json", "w") as f:
+              json.dump(result, f)
+          PY
+
+          cat app.json
+
+      - name: Create manifest.plist
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          import json
+          import os
+
+          with open("app.json") as f:
+              app = json.load(f)
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG"]
+
+          ipa_url = f"https://github.com/{repo}/releases/download/{tag}/PicsArt.AI.Photo.Editor.-.v30.7.2.ipa"
+
+          manifest = {
+              "items": [
+                  {
+                      "assets": [
+                          {
+                              "kind": "software-package",
+                              "url": ipa_url
+                          }
+                      ],
+                      "metadata": {
+                          "bundle-identifier": app["bundle_id"],
+                          "bundle-version": app["version"],
+                          "kind": "software",
+                          "title": app["name"]
+                      }
+                  }
+              ]
+          }
+
+          with open("manifest.plist", "wb") as f:
+              plistlib.dump(manifest, f, fmt=plistlib.FMT_XML)
+          PY
+
+      - name: Commit manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add manifest.plist
+          git commit -m "Generate OTA manifest" || echo "No changes"
+          git push
