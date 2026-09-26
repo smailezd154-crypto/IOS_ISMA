@@ -16,7 +16,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download IPA from Release
+      - name: Download IPA
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
@@ -28,71 +28,82 @@ jobs:
             --pattern "*.ipa" \
             --dir ipa
 
-          IPA=$(find ipa -type f -name "*.ipa" | head -n 1)
+          IPA=$(find ipa -type f -name "*.ipa" -print -quit)
 
           if [ -z "$IPA" ]; then
-            echo "ERROR: IPA file not found in Release"
+            echo "ERROR: IPA not found in Release"
             exit 1
           fi
 
           echo "IPA: $IPA"
           echo "IPA_PATH=$IPA" >> "$GITHUB_ENV"
 
-      - name: Extract app information
+      - name: Extract application
         run: |
           rm -rf extracted
           mkdir extracted
 
           unzip -q "$IPA_PATH" -d extracted
 
-          PLIST=$(find extracted/Payload -type f -name "Info.plist" | head -n 1)
+          APP_PLIST=$(find extracted/Payload -maxdepth 2 -type f -path "*/Info.plist" -print -quit)
 
-          if [ -z "$PLIST" ]; then
-            echo "ERROR: Info.plist not found"
+          if [ -z "$APP_PLIST" ]; then
+            echo "ERROR: Application Info.plist not found"
             exit 1
           fi
 
-          echo "Info.plist: $PLIST"
+          echo "Application Info.plist: $APP_PLIST"
 
-          python3 - "$PLIST" <<'PY'
+          python3 - "$APP_PLIST" <<'PY'
           import plistlib
           import sys
 
-          with open(sys.argv[1], "rb") as f:
-              p = plistlib.load(f)
+          path = sys.argv[1]
 
-          bundle_id = p.get("CFBundleIdentifier")
-          version = p.get("CFBundleShortVersionString") or p.get("CFBundleVersion")
-          name = p.get("CFBundleDisplayName") or p.get("CFBundleName") or "iOS App"
+          with open(path, "rb") as f:
+              plist = plistlib.load(f)
 
-          if not bundle_id:
-              raise SystemExit("ERROR: Bundle ID not found")
-
-          if not version:
-              raise SystemExit("ERROR: App version not found")
-
-          with open("bundle_id.txt", "w") as f:
-              f.write(bundle_id)
-
-          with open("version.txt", "w") as f:
-              f.write(version)
-
-          with open("app_name.txt", "w") as f:
-              f.write(name)
+          bundle_id = plist.get("CFBundleIdentifier", "")
+          app_name = (
+              plist.get("CFBundleDisplayName")
+              or plist.get("CFBundleName")
+              or "iOS App"
+          )
+          version = (
+              plist.get("CFBundleShortVersionString")
+              or plist.get("CFBundleVersion")
+              or ""
+          )
 
           print("Bundle ID:", bundle_id)
+          print("App name:", app_name)
           print("Version:", version)
-          print("Name:", name)
+
+          if not bundle_id:
+              raise SystemExit("ERROR: CFBundleIdentifier not found")
+
+          with open("bundle_id.txt", "w") as f:
+              f.write(str(bundle_id))
+
+          with open("app_name.txt", "w") as f:
+              f.write(str(app_name))
+
+          with open("version.txt", "w") as f:
+              f.write(str(version))
           PY
 
-      - name: Create manifest.plist
+      - name: Create manifest
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           IPA_NAME=$(basename "$IPA_PATH")
           BUNDLE_ID=$(cat bundle_id.txt)
-          VERSION=$(cat version.txt)
           APP_NAME=$(cat app_name.txt)
+          VERSION=$(cat version.txt)
+
+          if [ -z "$VERSION" ]; then
+            VERSION="${TAG#v}"
+          fi
 
           IPA_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IPA_NAME}"
 
@@ -143,9 +154,8 @@ jobs:
           git add manifest.plist
 
           if git diff --cached --quiet; then
-            echo "manifest.plist is already up to date"
-            exit 0
+            echo "No changes to commit"
+          else
+            git commit -m "Generate OTA manifest"
+            git push
           fi
-
-          git commit -m "Generate OTA manifest"
-          git push
