@@ -13,65 +13,97 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download IPA
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download IPA from Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           mkdir -p ipa
+
           gh release download "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "$GITHUB_REPOSITORY" \
             --pattern "*.ipa" \
             --dir ipa
 
-      - name: Read app information
-        id: app
+          IPA=$(find ipa -type f -name "*.ipa" | head -n 1)
+
+          if [ -z "$IPA" ]; then
+            echo "ERROR: IPA file not found in Release"
+            exit 1
+          fi
+
+          echo "IPA: $IPA"
+          echo "IPA_PATH=$IPA" >> "$GITHUB_ENV"
+
+      - name: Extract app information
         run: |
-          IPA=$(find ipa -name "*.ipa" | head -n 1)
+          rm -rf extracted
+          mkdir extracted
 
-          mkdir -p extracted
-          unzip -q "$IPA" -d extracted
+          unzip -q "$IPA_PATH" -d extracted
 
-          PLIST=$(find extracted/Payload -name "Info.plist" | head -n 1)
+          PLIST=$(find extracted/Payload -type f -name "Info.plist" | head -n 1)
+
+          if [ -z "$PLIST" ]; then
+            echo "ERROR: Info.plist not found"
+            exit 1
+          fi
+
+          echo "Info.plist: $PLIST"
 
           python3 - "$PLIST" <<'PY'
           import plistlib
-          import json
           import sys
 
-          plist_path = sys.argv[1]
+          with open(sys.argv[1], "rb") as f:
+              p = plistlib.load(f)
 
-          with open(plist_path, "rb") as f:
-              data = plistlib.load(f)
+          bundle_id = p.get("CFBundleIdentifier")
+          version = p.get("CFBundleShortVersionString") or p.get("CFBundleVersion")
+          name = p.get("CFBundleDisplayName") or p.get("CFBundleName") or "iOS App"
 
-          result = {
-              "bundle_id": data.get("CFBundleIdentifier", ""),
-              "name": data.get("CFBundleDisplayName") or data.get("CFBundleName", "iOS App"),
-              "version": data.get("CFBundleShortVersionString") or data.get("CFBundleVersion", "1.0")
-          }
+          if not bundle_id:
+              raise SystemExit("ERROR: Bundle ID not found")
 
-          with open("app.json", "w") as f:
-              json.dump(result, f)
+          if not version:
+              raise SystemExit("ERROR: App version not found")
+
+          with open("bundle_id.txt", "w") as f:
+              f.write(bundle_id)
+
+          with open("version.txt", "w") as f:
+              f.write(version)
+
+          with open("app_name.txt", "w") as f:
+              f.write(name)
+
+          print("Bundle ID:", bundle_id)
+          print("Version:", version)
+          print("Name:", name)
           PY
-
-          cat app.json
 
       - name: Create manifest.plist
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          python3 - <<'PY'
+          IPA_NAME=$(basename "$IPA_PATH")
+          BUNDLE_ID=$(cat bundle_id.txt)
+          VERSION=$(cat version.txt)
+          APP_NAME=$(cat app_name.txt)
+
+          IPA_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IPA_NAME}"
+
+          python3 - "$IPA_URL" "$BUNDLE_ID" "$VERSION" "$APP_NAME" <<'PY'
           import plistlib
-          import json
-          import os
+          import sys
 
-          with open("app.json") as f:
-              app = json.load(f)
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          tag = os.environ["TAG"]
-
-          ipa_url = f"https://github.com/{repo}/releases/download/{tag}/PicsArt.AI.Photo.Editor.-.v30.7.2.ipa"
+          ipa_url = sys.argv[1]
+          bundle_id = sys.argv[2]
+          version = sys.argv[3]
+          app_name = sys.argv[4]
 
           manifest = {
               "items": [
@@ -83,17 +115,24 @@ jobs:
                           }
                       ],
                       "metadata": {
-                          "bundle-identifier": app["bundle_id"],
-                          "bundle-version": app["version"],
+                          "bundle-identifier": bundle_id,
+                          "bundle-version": version,
                           "kind": "software",
-                          "title": app["name"]
+                          "title": app_name
                       }
                   }
               ]
           }
 
           with open("manifest.plist", "wb") as f:
-              plistlib.dump(manifest, f, fmt=plistlib.FMT_XML)
+              plistlib.dump(
+                  manifest,
+                  f,
+                  fmt=plistlib.FMT_XML,
+                  sort_keys=False
+              )
+
+          print("manifest.plist created successfully")
           PY
 
       - name: Commit manifest
@@ -102,5 +141,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add manifest.plist
-          git commit -m "Generate OTA manifest" || echo "No changes"
+
+          if git diff --cached --quiet; then
+            echo "manifest.plist is already up to date"
+            exit 0
+          fi
+
+          git commit -m "Generate OTA manifest"
           git push
