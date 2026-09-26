@@ -1,6 +1,7 @@
 name: Build OTA manifest
 
 on:
+  workflow_dispatch:
   release:
     types: [published]
 
